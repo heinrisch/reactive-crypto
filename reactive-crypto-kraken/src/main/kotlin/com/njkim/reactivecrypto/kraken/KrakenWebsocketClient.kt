@@ -27,6 +27,7 @@ import com.njkim.reactivecrypto.core.common.model.order.TickData
 import com.njkim.reactivecrypto.core.common.model.order.TradeSideType
 import com.njkim.reactivecrypto.core.websocket.AbstractExchangeWebsocketClient
 import com.njkim.reactivecrypto.kraken.model.KrakenOrderBook
+import com.njkim.reactivecrypto.kraken.model.KrakenOrderBookUnit
 import com.njkim.reactivecrypto.kraken.model.KrakenSubscriptionStatus
 import com.njkim.reactivecrypto.kraken.model.KrakenTickDataWrapper
 import mu.KotlinLogging
@@ -57,13 +58,22 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
     }
 
     override fun createDepthSnapshot(subscribeTargets: List<CurrencyPair>): Flux<OrderBook> {
-        val currentOrderBookMap: MutableMap<CurrencyPair, OrderBook> = ConcurrentHashMap()
+        val krakenOrderBookMap: MutableMap<CurrencyPair, KrakenOrderBook> = ConcurrentHashMap()
         val channelCurrencyPairMap: MutableMap<Int, CurrencyPair> = ConcurrentHashMap()
 
-        fun combineOrderBookUnits(old: List<OrderBookUnit>, new: List<OrderBookUnit>): List<OrderBookUnit> {
-            val newPrices = new.map { it.price.stripTrailingZeros() }
-            val filteredList = old.filter { it.price.stripTrailingZeros() !in newPrices }
-            return filteredList + new.filter { it.quantity > BigDecimal.ZERO }
+        fun combineKrakenOrderBookUnits(old: List<KrakenOrderBookUnit>, new: List<KrakenOrderBookUnit>): List<KrakenOrderBookUnit> {
+            val map = old.map { it.price.stripTrailingZeros() to it }.toMap().toMutableMap()
+            new.forEach { newUnit ->
+                map.compute(newUnit.price.stripTrailingZeros()) { _, curUnit ->
+                    if (newUnit.timestamp <= curUnit?.timestamp ?: ZonedDateTime.now().minusYears(1)) throw Exception("Old unit newer than new unit ${newUnit.timestamp} | ${curUnit?.timestamp}")
+                    when {
+                        newUnit.volume <= BigDecimal.ZERO -> null
+                        curUnit == null -> newUnit
+                        else -> newUnit
+                    }
+                }
+            }
+            return map.values.toList()
         }
 
         val subscribeSymbols = subscribeTargets
@@ -93,11 +103,24 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
                 }
             }
             .filter { !it.contains("\"event\":\"") }
-            .map { objectMapper.readValue<KrakenOrderBook>(it) }
+            .map { input ->
+                val newOrderBook = objectMapper.readValue<KrakenOrderBook>(input)
+                val currencyPair = channelCurrencyPairMap[newOrderBook.channelID]!!
+
+                return@map (if (newOrderBook.isSnapshot) newOrderBook
+                else {
+                    with(krakenOrderBookMap.getValue(currencyPair)) {
+
+                        KrakenOrderBook(
+                            channelID,
+                            asks = combineKrakenOrderBookUnits(asks, newOrderBook.asks).sortedBy { it.price }.take(10),
+                            bids = combineKrakenOrderBookUnits(bids, newOrderBook.bids).sortedByDescending { it.price }.take(10),
+                            isSnapshot = false
+                        )
+                    }
+                }).also { krakenOrderBookMap[currencyPair] = it }
+            }
             .map { krakenOrderBook ->
-                if (krakenOrderBook.isSnapshot) {
-                    currentOrderBookMap.remove(channelCurrencyPairMap[krakenOrderBook.channelID]!!)
-                }
                 val now = ZonedDateTime.now()
                 OrderBook(
                     "$now",
@@ -108,24 +131,10 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
                     krakenOrderBook.asks.map { OrderBookUnit(it.price, it.volume, TradeSideType.SELL, null) }
                 )
             }
-            .map { orderBook ->
-                val prevOrderBook = currentOrderBookMap.getOrPut(orderBook.currencyPair) { orderBook }
-
-                val currentOrderBook = prevOrderBook.copy(
-                    eventTime = orderBook.eventTime,
-                    asks = combineOrderBookUnits(prevOrderBook.asks, orderBook.asks)
-                        .sortedBy { it.price }.take(10),
-                    bids = combineOrderBookUnits(prevOrderBook.bids, orderBook.bids)
-                        .sortedByDescending { it.price }.take(10)
-                )
-
-                currentOrderBookMap[currentOrderBook.currencyPair] = currentOrderBook
-                currentOrderBook
-            }
             .doOnError { log.error(it.message, it) }
             .doFinally {
                 // cleanup memory limit orderBook when disconnected
-                currentOrderBookMap.clear()
+                krakenOrderBookMap.clear()
                 channelCurrencyPairMap.clear()
             }
     }
