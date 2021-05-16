@@ -36,6 +36,7 @@ import reactor.netty.http.client.HttpClient
 import java.math.BigDecimal
 import java.time.ZonedDateTime
 import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.CRC32
 
 /**
  * Kraken Websockets Public API Version 0.1.1
@@ -61,11 +62,16 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
         val krakenOrderBookMap: MutableMap<CurrencyPair, KrakenOrderBook> = ConcurrentHashMap()
         val channelCurrencyPairMap: MutableMap<Int, CurrencyPair> = ConcurrentHashMap()
 
-        fun combineKrakenOrderBookUnits(old: List<KrakenOrderBookUnit>, new: List<KrakenOrderBookUnit>): List<KrakenOrderBookUnit> {
+        fun combineKrakenOrderBookUnits(
+            old: List<KrakenOrderBookUnit>,
+            new: List<KrakenOrderBookUnit>
+        ): List<KrakenOrderBookUnit> {
             val map = old.map { it.price.stripTrailingZeros() to it }.toMap().toMutableMap()
             new.forEach { newUnit ->
                 map.compute(newUnit.price.stripTrailingZeros()) { _, curUnit ->
-                    if (newUnit.timestamp <= curUnit?.timestamp ?: ZonedDateTime.now().minusYears(1)) throw Exception("Old unit newer than new unit ${newUnit.timestamp} | ${curUnit?.timestamp}")
+                    if (newUnit.timestamp <= curUnit?.timestamp ?: ZonedDateTime.now()
+                            .minusYears(1)
+                    ) throw Exception("Old unit newer than new unit ${newUnit.timestamp} | ${curUnit?.timestamp}")
                     when {
                         newUnit.volume <= BigDecimal.ZERO -> null
                         curUnit == null -> newUnit
@@ -106,19 +112,22 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
             .map { input ->
                 val newOrderBook = objectMapper.readValue<KrakenOrderBook>(input)
                 val currencyPair = channelCurrencyPairMap[newOrderBook.channelID]!!
-
-                return@map (if (newOrderBook.isSnapshot) newOrderBook
+                return@map (if (newOrderBook.isSnapshot) newOrderBook.also { println("New snapshot") }
                 else {
                     with(krakenOrderBookMap.getValue(currencyPair)) {
-
                         KrakenOrderBook(
                             channelID,
                             asks = combineKrakenOrderBookUnits(asks, newOrderBook.asks).sortedBy { it.price }.take(10),
-                            bids = combineKrakenOrderBookUnits(bids, newOrderBook.bids).sortedByDescending { it.price }.take(10),
-                            isSnapshot = false
+                            bids = combineKrakenOrderBookUnits(bids, newOrderBook.bids).sortedByDescending { it.price }
+                                .take(10),
+                            isSnapshot = false,
+                            checksum = newOrderBook.checksum
                         )
                     }
-                }).also { krakenOrderBookMap[currencyPair] = it }
+                }).also {
+                    krakenOrderBookMap[currencyPair] = it
+                    validateChecksum(it)
+                }
             }
             .map { krakenOrderBook ->
                 val now = ZonedDateTime.now()
@@ -137,6 +146,21 @@ class KrakenWebsocketClient : AbstractExchangeWebsocketClient() {
                 krakenOrderBookMap.clear()
                 channelCurrencyPairMap.clear()
             }
+    }
+
+    private fun validateChecksum(order: KrakenOrderBook) {
+        order.checksum ?: return // Some things don't contain checksum
+
+        fun List<KrakenOrderBookUnit>.orderToString() =
+            joinToString("") {
+                fun String.clean() = replace(".", "").dropWhile { c -> c == '0' }
+                it.price.toString().clean() +
+                it.volume.toString().clean()
+            }
+
+        val sum = order.asks.orderToString() + order.bids.orderToString()
+        val calculatedChecksum = CRC32().apply { update(sum.toByteArray()) }.value
+        if (order.checksum != calculatedChecksum.toString()) throw Exception("Checksum mismatch: ${order.checksum} != $calculatedChecksum")
     }
 
     override fun createTradeWebsocket(subscribeTargets: List<CurrencyPair>): Flux<TickData> {

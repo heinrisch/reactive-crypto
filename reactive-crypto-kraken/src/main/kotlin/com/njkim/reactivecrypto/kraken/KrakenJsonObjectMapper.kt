@@ -118,8 +118,9 @@ class KrakenJsonObjectMapper : ExchangeJsonObjectMapper {
                 val isSnapshot = orders.has("as") && orders.has("bs")
                 val asks = extractOrderBookUnit(orders, "as", "a")
                 val bids = extractOrderBookUnit(orders, "bs", "b")
+                val checksum = orders.get("c")?.asText()
 
-                return KrakenOrderBook(channelId, asks, bids, isSnapshot)
+                return KrakenOrderBook(channelId, asks, bids, isSnapshot, checksum)
             }
 
             private fun extractOrderBookUnit(
@@ -134,8 +135,8 @@ class KrakenJsonObjectMapper : ExchangeJsonObjectMapper {
                 return (orderBookUnitsNode?.toList() ?: listOf())
                     .map {
                         KrakenOrderBookUnit(
-                            instance.convertValue(it.get(0).asText()),
-                            instance.convertValue(it.get(1).asText()),
+                            BigDecimal(it.get(0).asText()),
+                            BigDecimal(it.get(1).asText()),
                             Instant.ofEpochMilli((it.get(2).asDouble() * 1000).toLong())
                                 .plusNanos((it.get(2).asDouble() * 1000000 % 1000).toLong())
                                 .atZone(ZoneId.systemDefault())

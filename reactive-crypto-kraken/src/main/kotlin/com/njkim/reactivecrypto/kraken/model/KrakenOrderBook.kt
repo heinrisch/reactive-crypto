@@ -18,6 +18,7 @@ package com.njkim.reactivecrypto.kraken.model
 
 import java.math.BigDecimal
 import java.time.ZonedDateTime
+import java.util.zip.Checksum
 
 /**
  * @property channelID ChannelID of pair-order book levels subscription
@@ -31,7 +32,8 @@ data class KrakenOrderBook(
     val channelID: Int,
     val asks: List<KrakenOrderBookUnit>,
     val bids: List<KrakenOrderBookUnit>,
-    val isSnapshot: Boolean
+    val isSnapshot: Boolean,
+    val checksum: String?
 )
 
 /**
